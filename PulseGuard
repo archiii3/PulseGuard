@@ -1,0 +1,61 @@
+import time
+import requests
+from datetime import datetime
+
+SERVICES = [
+    "https://api.github.com",
+    "https://example.com"
+]
+
+INTERVAL = 60  # seconds
+
+
+def check_service(url):
+    try:
+        start = time.time()
+        response = requests.get(url, timeout=10)
+        elapsed = round((time.time() - start) * 1000, 2)
+
+        status = "ONLINE" if response.status_code < 400 else "ERROR"
+
+        return {
+            "url": url,
+            "status": status,
+            "code": response.status_code,
+            "response_time": elapsed
+        }
+
+    except requests.RequestException as error:
+        return {
+            "url": url,
+            "status": "OFFLINE",
+            "code": None,
+            "response_time": None,
+            "error": str(error)
+        }
+
+
+def monitor():
+    print("PulseGuard started...\n")
+
+    while True:
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]")
+
+        for service in SERVICES:
+            result = check_service(service)
+
+            if result["status"] == "ONLINE":
+                print(
+                    f"✓ {result['url']} | "
+                    f"{result['code']} | "
+                    f"{result['response_time']}ms"
+                )
+            else:
+                print(f"✗ {result['url']} | {result['status']}")
+
+        print("-" * 50)
+        time.sleep(INTERVAL)
+
+
+if __name__ == "__main__":
+    monitor()

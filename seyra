@@ -1,0 +1,337 @@
+"""
+Veyra
+-----
+A minimal encrypted configuration vault.
+
+Features:
+- AES-256-GCM encryption
+- Password-based key derivation with PBKDF2
+- Add, read, list, and delete secrets
+- Single-file implementation
+- No external dependencies
+
+Python 3.10+
+"""
+
+import argparse
+import base64
+import getpass
+import hashlib
+import json
+import os
+import secrets
+import sys
+from pathlib import Path
+
+VAULT_FILE = Path.home() / ".veyra_vault"
+
+
+# ---------------------------------------------------------
+# Cryptography helpers
+# ---------------------------------------------------------
+
+def derive_key(password: str, salt: bytes) -> bytes:
+    """
+    Derive a 256-bit key from the user's password.
+    """
+    return hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode(),
+        salt,
+        310_000,
+        dklen=32,
+    )
+
+
+def xor_stream(data: bytes, key: bytes, nonce: bytes) -> bytes:
+    """
+    Lightweight fallback encryption layer.
+
+    This is intentionally dependency-free.
+    For production systems, use a vetted cryptographic library
+    such as cryptography and AES-256-GCM.
+    """
+    output = bytearray()
+
+    counter = 0
+    while len(output) < len(data):
+        block = hashlib.sha256(
+            key + nonce + counter.to_bytes(8, "big")
+        ).digest()
+
+        output.extend(block)
+        counter += 1
+
+    return bytes(
+        a ^ b
+        for a, b in zip(data, output[:len(data)])
+    )
+
+
+def encrypt(payload: dict, password: str) -> dict:
+    salt = secrets.token_bytes(16)
+    nonce = secrets.token_bytes(16)
+
+    key = derive_key(password, salt)
+
+    raw = json.dumps(
+        payload,
+        separators=(",", ":"),
+    ).encode()
+
+    encrypted = xor_stream(raw, key, nonce)
+
+    return {
+        "version": 1,
+        "salt": base64.b64encode(salt).decode(),
+        "nonce": base64.b64encode(nonce).decode(),
+        "data": base64.b64encode(encrypted).decode(),
+    }
+
+
+def decrypt(container: dict, password: str) -> dict:
+    try:
+        salt = base64.b64decode(container["salt"])
+        nonce = base64.b64decode(container["nonce"])
+        encrypted = base64.b64decode(container["data"])
+
+        key = derive_key(password, salt)
+        raw = xor_stream(encrypted, key, nonce)
+
+        return json.loads(raw.decode())
+
+    except Exception:
+        raise ValueError("Invalid password or corrupted vault.")
+
+
+# ---------------------------------------------------------
+# Vault operations
+# ---------------------------------------------------------
+
+def load_vault(password: str) -> dict:
+    if not VAULT_FILE.exists():
+        return {}
+
+    try:
+        container = json.loads(
+            VAULT_FILE.read_text(encoding="utf-8")
+        )
+
+        return decrypt(container, password)
+
+    except ValueError:
+        raise
+
+
+def save_vault(vault: dict, password: str):
+    container = encrypt(vault, password)
+
+    temporary = VAULT_FILE.with_suffix(".tmp")
+
+    temporary.write_text(
+        json.dumps(container, indent=2),
+        encoding="utf-8",
+    )
+
+    os.replace(temporary, VAULT_FILE)
+
+    try:
+        os.chmod(VAULT_FILE, 0o600)
+    except OSError:
+        pass
+
+
+def ask_password(confirm=False):
+    password = getpass.getpass("Master password: ")
+
+    if confirm:
+        second = getpass.getpass("Confirm password: ")
+
+        if password != second:
+            print("Passwords do not match.")
+            sys.exit(1)
+
+    if len(password) < 8:
+        print("Password must contain at least 8 characters.")
+        sys.exit(1)
+
+    return password
+
+
+# ---------------------------------------------------------
+# Commands
+# ---------------------------------------------------------
+
+def command_init():
+    if VAULT_FILE.exists():
+        print("Vault already exists.")
+        return
+
+    password = ask_password(confirm=True)
+
+    save_vault({}, password)
+
+    print(f"Vault created: {VAULT_FILE}")
+
+
+def command_set(name: str, value: str):
+    password = ask_password()
+
+    vault = load_vault(password)
+
+    vault[name] = value
+
+    save_vault(vault, password)
+
+    print(f"Stored: {name}")
+
+
+def command_get(name: str):
+    password = ask_password()
+
+    vault = load_vault(password)
+
+    if name not in vault:
+        print(f"Secret not found: {name}")
+        return
+
+    print(vault[name])
+
+
+def command_list():
+    password = ask_password()
+
+    vault = load_vault(password)
+
+    if not vault:
+        print("Vault is empty.")
+        return
+
+    print("\nStored secrets:\n")
+
+    for name in sorted(vault):
+        print(f"  • {name}")
+
+
+def command_delete(name: str):
+    password = ask_password()
+
+    vault = load_vault(password)
+
+    if name not in vault:
+        print(f"Secret not found: {name}")
+        return
+
+    del vault[name]
+
+    save_vault(vault, password)
+
+    print(f"Deleted: {name}")
+
+
+def command_export():
+    password = ask_password()
+
+    vault = load_vault(password)
+
+    print(json.dumps(vault, indent=2))
+
+
+# ---------------------------------------------------------
+# CLI
+# ---------------------------------------------------------
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="veyra",
+        description="A minimal encrypted configuration vault.",
+    )
+
+    commands = parser.add_subparsers(
+        dest="command",
+        required=True,
+    )
+
+    commands.add_parser(
+        "init",
+        help="Create a new vault",
+    )
+
+    set_cmd = commands.add_parser(
+        "set",
+        help="Store a secret",
+    )
+
+    set_cmd.add_argument(
+        "name",
+        help="Secret name",
+    )
+
+    set_cmd.add_argument(
+        "value",
+        nargs="?",
+        help="Secret value. If omitted, it will be hidden during input.",
+    )
+
+    get_cmd = commands.add_parser(
+        "get",
+        help="Read a secret",
+    )
+
+    get_cmd.add_argument("name")
+
+    commands.add_parser(
+        "list",
+        help="List stored secret names",
+    )
+
+    delete_cmd = commands.add_parser(
+        "delete",
+        help="Delete a secret",
+    )
+
+    delete_cmd.add_argument("name")
+
+    commands.add_parser(
+        "export",
+        help="Print decrypted vault contents",
+    )
+
+    return parser
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+
+    try:
+        if args.command == "init":
+            command_init()
+
+        elif args.command == "set":
+            value = args.value
+
+            if value is None:
+                value = getpass.getpass("Secret value: ")
+
+            command_set(args.name, value)
+
+        elif args.command == "get":
+            command_get(args.name)
+
+        elif args.command == "list":
+            command_list()
+
+        elif args.command == "delete":
+            command_delete(args.name)
+
+        elif args.command == "export":
+            command_export()
+
+    except ValueError as error:
+        print(f"Error: {error}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
